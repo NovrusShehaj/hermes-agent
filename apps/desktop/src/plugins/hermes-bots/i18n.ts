@@ -337,6 +337,7 @@ type BotsMessages = {
     addServerFailed: string
     noTarget: string
     setKeyFailed: (name: string) => string
+    setKeyPartial: (saved: number) => string
     configured: (name: string) => string
     authenticated: (name: string) => string
     testFailed: string
@@ -779,6 +780,7 @@ const en: BotsMessages = {
     addServerFailed: 'Could not add server',
     noTarget: 'No target profile',
     setKeyFailed: key => `Failed to set ${key}`,
+    setKeyPartial: saved => `${saved} already saved`,
     configured: name => `${name} configured`,
     authenticated: name => `${name} authenticated`,
     testFailed: 'Server test failed after setup',
@@ -1216,6 +1218,7 @@ const ja: BotsMessages = {
     addServerFailed: 'サーバーを追加できませんでした',
     noTarget: '対象プロファイルがありません',
     setKeyFailed: key => `${key} の設定に失敗しました`,
+    setKeyPartial: saved => `${saved} 件は保存済み`,
     configured: name => `${name} を設定しました`,
     authenticated: name => `${name} の認証が完了しました`,
     testFailed: '設定後のサーバーテストに失敗しました',
@@ -1643,6 +1646,7 @@ const zh: BotsMessages = {
     addServerFailed: '无法添加服务器',
     noTarget: '没有目标配置文件',
     setKeyFailed: key => `无法设置 ${key}`,
+    setKeyPartial: saved => `已保存 ${saved} 个`,
     configured: name => `${name} 已配置`,
     authenticated: name => `${name} 已验证身份`,
     testFailed: '配置后的服务器测试失败',
@@ -2067,6 +2071,7 @@ const zhHant: BotsMessages = {
     addServerFailed: '無法新增伺服器',
     noTarget: '沒有目標設定檔',
     setKeyFailed: key => `無法設定 ${key}`,
+    setKeyPartial: saved => `已儲存 ${saved} 個`,
     configured: name => `${name} 已設定`,
     authenticated: name => `${name} 已驗證身分`,
     testFailed: '設定後的伺服器測試失敗',

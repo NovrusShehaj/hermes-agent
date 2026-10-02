@@ -59,7 +59,7 @@ import {
 } from './group-membership'
 import { useBots } from './i18n'
 import { botProfileIdentity, displayName } from './labels'
-import { McpSetupButton } from './mcp-setup'
+import { McpSetupButton, type McpSetupTarget } from './mcp-setup'
 import { ModelPicker } from './model-picker'
 import type {
   CapabilityEntry,
@@ -72,7 +72,7 @@ import { deleteBot } from './profile-ops'
 import { botRosterMeta } from './routing'
 import { HubSkillsSection } from './skills-hub'
 import { composeSoul } from './soul'
-import type { BotMeta, ConnectionRow, RosterRow } from './types'
+import type { BotMeta, ConnectionRow, ProfileRoute, RosterRow } from './types'
 
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
@@ -131,6 +131,11 @@ export function CreateAgentDialog({ open, onClose, onConfigureModel, roster }: C
   // button + MCP setup buttons). Distinct from createdRef on purpose:
   // createdRef must stay a slug string for its sibling consumers.
   const flightRef = useRef<Promise<null | string> | null>(null)
+  // The connection selection the materialized profile was created on. The
+  // flight captures it before its first await, so a later selection flip can
+  // retire (never re-guess) an MCP setup that would otherwise write the
+  // wrong machine.
+  const createdOnRef = useRef('')
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   // Default shapes mode: deterministic blob face drawn from the agent's name
@@ -172,6 +177,9 @@ export function CreateAgentDialog({ open, onClose, onConfigureModel, roster }: C
       )
       .catch(() => setConnections([]))
   }, [open, connections])
+  const targetConnectionRef = useRef(targetConnection)
+
+  targetConnectionRef.current = targetConnection
   const activeConnectionId = String(host.state?.connectionId?.get?.() || '').trim()
   // Remote target = an explicitly picked registry connection that is not the
   // one this window is already on.
@@ -181,21 +189,22 @@ export function CreateAgentDialog({ open, onClose, onConfigureModel, roster }: C
     ? (connections || []).find(c => c.id === targetConnection)?.label || targetConnection
     : ''
 
+  /** The create target's route: the picked connection's default backend door
+   *  for remote targets, the active gateway (null) otherwise. Shared by
+   *  requestForTarget and the MCP setup target so both follow one selection. */
+  const targetRoute: null | ProfileRoute = remoteTarget
+    ? {
+        connectionId: targetConnection,
+        mode: 'remote',
+        profile: 'default',
+        targetProfile: 'default'
+      }
+    : null
+
   /** Gateway RPC on the create target: the picked connection's default
    *  backend for remote targets, the active gateway otherwise. */
   const requestForTarget = <T,>(method: string, params: Record<string, unknown> = {}): Promise<T> =>
-    remoteTarget
-      ? host.requestProfile(
-          {
-            connectionId: targetConnection,
-            mode: 'remote',
-            profile: 'default',
-            targetProfile: 'default'
-          },
-          method,
-          params
-        )
-      : host.request(method, params)
+    targetRoute ? host.requestProfile(targetRoute, method, params) : host.request(method, params)
 
   // Set once ensureAgentCreated() materializes the profile for the live
   // Capabilities tab (CapabilitiesView needs a real backend to point at). State —
@@ -386,6 +395,11 @@ export function CreateAgentDialog({ open, onClose, onConfigureModel, roster }: C
         return null
       }
 
+      // Capture the selection BEFORE the first await: the created profile
+      // belongs to this connection, and an MCP setup retires rather than
+      // follow a later selection.
+      createdOnRef.current = targetConnection
+
       await requestForTarget('profiles.create', {
         name: slug,
         description: descriptionText,
@@ -497,6 +511,25 @@ export function CreateAgentDialog({ open, onClose, onConfigureModel, roster }: C
     })
 
     return flight
+  }
+
+  /** Complete setup target for the MCP buttons: the captured selection's
+   *  route plus the materialized slug. If the selection moved since the
+   *  creation settled — or the shared flight created on another selection —
+   *  retire instead of guessing a new owner. */
+  const ensureSetupTarget = async (): Promise<null | McpSetupTarget> => {
+    const captured = targetConnection
+    const slugCreated = await ensureAgentCreated()
+
+    if (!slugCreated) {
+      return null
+    }
+
+    if (createdOnRef.current !== captured || targetConnectionRef.current !== captured) {
+      return null
+    }
+
+    return { route: targetRoute, profile: slugCreated }
   }
 
   const submit = async () => {
@@ -959,7 +992,7 @@ export function CreateAgentDialog({ open, onClose, onConfigureModel, roster }: C
                               ) : null}
                               {needsSetup ? (
                                 <McpSetupButton
-                                  ensureProfile={ensureAgentCreated}
+                                  ensureTarget={ensureSetupTarget}
                                   entry={m}
                                   onDone={() => {
                                     // Setup done: mark installed so the row's
@@ -985,7 +1018,7 @@ export function CreateAgentDialog({ open, onClose, onConfigureModel, roster }: C
                                       mcp: true
                                     }))
                                   }}
-                                  profile={createdRef.current}
+                                  target={{ route: targetRoute, profile: createdRef.current || slug }}
                                 />
                               ) : null}
                               {m.description ? (
