@@ -91,7 +91,7 @@ import {
 import { reportPendingUpdateRun } from '@/store/shared-metrics'
 import { $archivedSessions } from '@/store/sidebar-archive'
 import { $titlebarAppActionsSide, titlebarAppActionsClusterCounts } from '@/store/titlebar-app-actions'
-import { armWakeWord, stopClientCapture } from '@/store/wake-word'
+import { armWakeWord, offerWakeUtterance, stopClientCapture } from '@/store/wake-word'
 import { isAuxiliaryWindow, isBrowserWindow, isHudWindow } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
 import type { SessionInfo } from '@/types/hermes'
@@ -880,37 +880,55 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       if (event.type === 'wake.detected') {
         const payload = event.payload as { profile?: null | string; start_new_session?: boolean } | undefined
+        const targetProfile = payload?.profile?.trim() || null
 
-        // Free the Mac mic so voice conversation can open getUserMedia.
-        // Server already pauses the detector lease; this stops client PCM feed.
-        stopClientCapture()
+        // Preserve the first utterance: hand the retained pre-event PCM to the
+        // voice conversation instead of killing the stream — speech spoken
+        // before this event arrived is exactly what the handoff keeps. Null
+        // when there is no client handoff (server-local capture, retired
+        // chain): fall back to the old stop-and-start behavior then.
+        const offer = offerWakeUtterance(targetProfile)
 
-        // Audible confirmation that the wake registered, before voice capture
-        // starts. Gated by the shared sound-mute toggle.
-        playWakeSound()
-        activateWakeIndicator()
+        if (offer) {
+          // The handoff keeps the mic stream alive, so an audible chime now
+          // would ride into the request audio — the visual indicator confirms
+          // the wake instead. No capture gap is inserted to play a sound.
+          activateWakeIndicator()
+        } else {
+          // Free the Mac mic so voice conversation can open getUserMedia.
+          // Server already pauses the detector lease; this stops client PCM feed.
+          stopClientCapture()
+
+          // Audible confirmation that the wake registered, before voice capture
+          // starts. Gated by the shared sound-mute toggle.
+          playWakeSound()
+          activateWakeIndicator()
+        }
 
         // Multi-profile routing: a wake phrase enrolled by another profile
         // re-homes the gateway to that profile first (live swap — same path
         // as clicking it in the profile rail), then opens the fresh session
-        // and starts voice there.
-        const targetProfile = payload?.profile?.trim()
-        const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+        // and starts voice there. The voice start waits for the routing to
+        // settle so the TARGET profile's composer — the one that consumes the
+        // handoff — is ready before audio is offered to it.
+        void (async () => {
+          const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
 
-        if (targetProfile && normalizeProfileKey(targetProfile) !== activeProfile) {
-          if (payload?.start_new_session !== false) {
-            newSessionInProfile(targetProfile)
-          } else {
-            void ensureGatewayProfile(normalizeProfileKey(targetProfile)).catch((error: unknown) => {
-              // #81094: the voice-path switch must surface its failure too.
-              notifyError(error, `Failed to switch to profile "${normalizeProfileKey(targetProfile)}"`)
-            })
+          if (targetProfile && normalizeProfileKey(targetProfile) !== activeProfile) {
+            if (payload?.start_new_session !== false) {
+              await newSessionInProfile(targetProfile)
+            } else {
+              await ensureGatewayProfile(normalizeProfileKey(targetProfile)).catch((error: unknown) => {
+                // #81094: the voice-path switch must surface its failure too.
+                notifyError(error, `Failed to switch to profile "${normalizeProfileKey(targetProfile)}"`)
+              })
+            }
+          } else if (payload?.start_new_session !== false) {
+            startFreshSessionDraft()
           }
-        } else if (payload?.start_new_session !== false) {
-          startFreshSessionDraft()
-        }
 
-        requestVoiceConversationStart()
+          requestVoiceConversationStart()
+        })()
 
         return
       }

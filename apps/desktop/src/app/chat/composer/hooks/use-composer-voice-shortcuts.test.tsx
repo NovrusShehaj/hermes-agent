@@ -84,7 +84,12 @@ vi.mock('@/store/gateway', async () => {
   return { $gateway: atom(null) }
 })
 vi.mock('@/store/composer-input-history', () => ({ resetBrowseState: vi.fn() }))
-vi.mock('@/store/wake-word', () => ({ resumeWakeAfterVoice: vi.fn(async () => undefined) }))
+vi.mock('@/store/wake-word', () => ({
+  cancelWakeUtteranceOffer: vi.fn(() => undefined),
+  peekWakeUtteranceOffer: vi.fn(() => null),
+  resumeWakeAfterVoice: vi.fn(async () => undefined),
+  takeWakeUtteranceOffer: vi.fn(() => null)
+}))
 vi.mock('../floating-target', () => ({ pinFloatingComposerCapture: vi.fn(() => undefined) }))
 
 function Composer({ disabled, target }: { disabled: boolean; target: string }) {

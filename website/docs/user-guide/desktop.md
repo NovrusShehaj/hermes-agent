@@ -183,6 +183,16 @@ Quick Entry is a small always-available composer summoned by a **global hotkey f
 
 Talk to Hermes and hear it back, the same [voice mode](./features/voice-mode.md) available elsewhere. On macOS the OS will prompt once for microphone access.
 
+With the [wake word](./features/wake-word.md) armed against a **remote backend** (client capture), the desktop preserves the **first utterance after "Hey Hermes"** — including words spoken before the voice window appears. The microphone keeps streaming through the wake handoff (only the detector stops being fed), and the first voice take is assembled from one continuous recording: a bounded retained window of what the mic heard before the wake event, joined gaplessly to everything after it, encoded once as mono PCM WAV for transcription. There is no need to pause after the phrase, and the wake chime is held back on wake-started turns so it can never become request audio.
+
+Know the boundaries:
+
+- **Retention is 5 seconds.** Speech spoken more than about five seconds before the wake event is outside the window — inside it, nothing is lost even when the detection event takes a moment to arrive over the network.
+- **The whole retained prefix rides along.** The wake protocol carries no phrase-end marker, so a short "Hey Hermes" lead-in may appear at the start of the transcript. Matching words are never stripped from your audio; what you said is what is transcribed.
+- **A first utterance is capped at 60 seconds**, and an unconsumed wake handoff expires after 10 seconds. If the cap clips a take, the app says so and re-arms for a clean retry instead of submitting a partial transcript as if it were complete.
+- **Later turns record exactly as before**, and an explicit mic click always takes precedence over a pending wake handoff.
+- **Server-local capture has no first-utterance preservation yet.** When the backend captures on its own microphone (local PortAudio), start talking once the voice session opens — the retained-utterance handoff covers client capture only.
+
 ### HUD mode
 
 **⌘/Ctrl+Shift+H** (or the titlebar button) detaches the chat into a chrome-free, always-on-top floating bar that sits over whatever you are working in. The app window steps aside; the HUD keeps your live conversation and a composer. Where you park it is context — the bar's position tells Hermes which app and screen you're asking about, so "this", "here", and "that page" resolve to what's underneath it.

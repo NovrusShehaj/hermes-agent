@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 
 import { closeMeterContext, meterContextsClosed } from '@/lib/mic-meter-context'
+import {
+  encodePcmWavMono,
+  pcmInt16Level,
+  WAKE_SAMPLE_RATE,
+  type WakeUtteranceLease
+} from '@/lib/wake-audio-handoff'
 
 type BrowserAudioContext = typeof AudioContext
 
@@ -14,6 +20,10 @@ export interface MicRecorderOptions {
   silenceLevel?: number
   silenceMs?: number
   idleSilenceMs?: number
+  /** First-utterance wake handoff: consume the retained PCM instead of
+   *  opening a stream. Single-use — a terminal lease falls back to the
+   *  ordinary start so the turn still works. */
+  captureLease?: WakeUtteranceLease
 }
 
 export interface MicRecording {
@@ -23,6 +33,9 @@ export interface MicRecording {
   /** The level meter failed during this take, so `heardSpeech` is unknown
    *  rather than false. */
   meterFailed?: boolean
+  /** The hard ceiling cut this take short — samples were dropped, so the
+   *  clip must be cancelled and retried, never submitted as complete. */
+  truncated?: boolean
 }
 
 export interface MicRecorderErrorCopy {
@@ -39,6 +52,12 @@ interface MicRecorderHandle {
   start: (options?: MicRecorderOptions) => Promise<void>
   stop: () => Promise<MicRecording | null>
   cancel: () => void
+}
+
+/** A live leased take: the wake handoff's PCM IS the mic stream. */
+interface LeasedTake {
+  take: WakeUtteranceLease
+  unsubscribe: () => void
 }
 
 /** Recorder + live-start mic failures → the same friendly copy: a DOMException
@@ -94,8 +113,26 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
   const silenceTriggeredRef = useRef(false)
   const silenceStartedAtRef = useRef<number | null>(null)
   const stopResolverRef = useRef<((recording: MicRecording | null) => void) | null>(null)
+  const leaseRef = useRef<LeasedTake | null>(null)
+  const leasePcmRef = useRef<Int16Array[]>([])
+  const leaseSamplesRef = useRef(0)
+  const leaseSilenceRef = useRef(0)
 
   const cleanup = () => {
+    const leased = leaseRef.current
+    leaseRef.current = null
+
+    if (leased) {
+      // Unmount / outer teardown while a leased take is still live: drop the
+      // handoff so its buffers and capture chain release exactly once.
+      leased.unsubscribe()
+      leased.take.cancel()
+    }
+
+    leasePcmRef.current = []
+    leaseSamplesRef.current = 0
+    leaseSilenceRef.current = 0
+
     if (animationRef.current) {
       window.cancelAnimationFrame(animationRef.current)
       animationRef.current = null
@@ -227,8 +264,72 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     }
   }
 
+  /**
+   * Leased-take VAD/silence policy adapter: the meter's semantics driven by
+   *  raw PCM chunks instead of analyser ticks. The level is `pcmInt16Level`
+   *  (the meter's normalized scale, NOT raw int16 RMS), and silence accrues on
+   *  the audio timeline (chunk sample counts) — so a prefix-only utterance
+   *  still counts as speech and ends the take on the trailing silence.
+   */
+  const processLeasedChunk = (chunk: Int16Array, options: MicRecorderOptions) => {
+    leasePcmRef.current.push(chunk)
+    leaseSamplesRef.current += chunk.length
+
+    const level = pcmInt16Level(chunk)
+    setLevel(level)
+    options.onLevel?.(level)
+
+    const speechThreshold = options.silenceLevel ?? 0
+    const silenceMs = options.silenceMs ?? 0
+    const idleSilenceMs = options.idleSilenceMs ?? 0
+
+    if (speechThreshold > 0 && options.onSilence && !silenceTriggeredRef.current) {
+      const chunkMs = (chunk.length / WAKE_SAMPLE_RATE) * 1000
+
+      if (level >= speechThreshold) {
+        heardSpeechRef.current = true
+        leaseSilenceRef.current = 0
+      } else if (heardSpeechRef.current && silenceMs > 0) {
+        leaseSilenceRef.current += chunkMs
+
+        if (leaseSilenceRef.current >= silenceMs) {
+          silenceTriggeredRef.current = true
+          // Deferred like failMeter: a verdict reached inside start()'s prefix
+          // processing must not re-enter the caller before start() resolves.
+          window.setTimeout(() => options.onSilence?.(), 0)
+        }
+      } else if (!heardSpeechRef.current && idleSilenceMs > 0 && (leaseSamplesRef.current / WAKE_SAMPLE_RATE) * 1000 >= idleSilenceMs) {
+        silenceTriggeredRef.current = true
+        window.setTimeout(() => options.onSilence?.(), 0)
+      }
+    }
+  }
+
   const start: MicRecorderHandle['start'] = async (options = {}) => {
-    if (recorderRef.current) {
+    if (recorderRef.current || leaseRef.current) {
+      return
+    }
+
+    // First-utterance wake handoff: the retained PCM is the mic stream — no
+    // second getUserMedia, no MediaRecorder, no meter context. `begin()` is
+    // single-use; a terminal lease (TTL expiry, cancel) falls through to the
+    // ordinary start so the turn still works.
+    const lease = options.captureLease
+    const snapshot = lease ? lease.begin() : null
+
+    if (lease && snapshot) {
+      heardSpeechRef.current = false
+      meterFailedRef.current = false
+      silenceTriggeredRef.current = false
+      silenceStartedAtRef.current = null
+
+      // Subscribe in the same synchronous block as begin() — the handoff is
+      // gapless only for listeners registered there.
+      const unsubscribe = lease.onSamples(chunk => processLeasedChunk(chunk, options))
+      leaseRef.current = { take: lease, unsubscribe }
+      setRecording(true)
+      processLeasedChunk(snapshot, options)
+
       return
     }
 
@@ -329,6 +430,50 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
 
   const stop: MicRecorderHandle['stop'] = () =>
     new Promise<MicRecording | null>(resolve => {
+      const leased = leaseRef.current
+
+      if (leased) {
+        leaseRef.current = null
+        leased.unsubscribe()
+
+        const chunks = leasePcmRef.current
+        const totalSamples = leaseSamplesRef.current
+        const heardSpeech = heardSpeechRef.current
+        const truncated = leased.take.truncated
+
+        // Terminal, exactly-once release of the handoff's capture chain.
+        leased.take.finish()
+        cleanup()
+
+        if (!totalSamples) {
+          resolve(null)
+
+          return
+        }
+
+        const merged = new Int16Array(totalSamples)
+        let offset = 0
+
+        for (const chunk of chunks) {
+          merged.set(chunk, offset)
+          offset += chunk.length
+        }
+
+        resolve({
+          // One continuous segment, encoded once — never joined to a
+          // MediaRecorder blob (that pairing produces an invalid file).
+          audio: encodePcmWavMono(merged, WAKE_SAMPLE_RATE),
+          durationMs: (totalSamples / WAKE_SAMPLE_RATE) * 1000,
+          heardSpeech,
+          // The level is computed directly from PCM — there is no meter to
+          // fail, so `heardSpeech` is known rather than blind.
+          meterFailed: false,
+          truncated
+        })
+
+        return
+      }
+
       const recorder = recorderRef.current
 
       if (!recorder || recorder.state === 'inactive') {
@@ -343,9 +488,16 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     })
 
   const cancel: MicRecorderHandle['cancel'] = () => {
+    const leased = leaseRef.current
     const recorder = recorderRef.current
     const resolver = stopResolverRef.current
     stopResolverRef.current = null
+
+    if (leased) {
+      leaseRef.current = null
+      leased.unsubscribe()
+      leased.take.cancel()
+    }
 
     if (recorder && recorder.state !== 'inactive') {
       recorder.ondataavailable = null

@@ -52,7 +52,10 @@ Hermes supports **client capture** for that case:
 3. The desktop opens the **local Mac/PC microphone**, resamples to 16 kHz mono
    int16, and streams short frames via the `wake.feed` RPC.
 4. On detection the backend emits `wake.detected` as usual; the desktop starts
-   the normal voice pipeline on the client mic.
+   the normal voice pipeline on the client mic. The mic stream stays open
+   through the handoff, and the first voice take includes a retained window of
+   what was spoken just before detection — see
+   [Voice](../desktop.md#voice) for the limits.
 
 ```yaml
 wake_word:

@@ -40,38 +40,90 @@ export interface ClientWakeCaptureOptions {
   stallTimeoutMs?: number
   /** Consecutive rejected/failed wake.feed calls before escalating. */
   maxConsecutiveFeedFailures?: number
+  /**
+   * Every resampled 16 kHz frame (silent frames INCLUDED) as int16 samples,
+   * before the feed queue — the retention feed for the first-utterance
+   * handoff. The feed queue drops old frames under latency and skips silence;
+   * this callback must see all of it so the retained window is gapless.
+   */
+  onFrame?: (frame: Int16Array) => void
 }
 
 export interface ClientWakeCaptureHandle {
   stop: () => void
   readonly active: boolean
+  /** Stop feeding `wake.feed` WITHOUT stopping the mic: a valid wake hands
+   *  the stream to the first-utterance lease, which needs the same capture
+   *  chain to keep producing samples. Idempotent; `stop()` remains the full
+   *  teardown. */
+  pauseFeed: () => void
 }
 
-function downsampleTo16k(input: Float32Array, inputRate: number): Float32Array {
-  if (inputRate === TARGET_RATE) {
-    return input
-  }
+/**
+ * Phase-carrying box downsampler. Both the unconsumed input samples AND the
+ * fractional source phase carry across callbacks, so every output sits on the
+ * same source grid no matter how the input is blocked: per-block floor() alone
+ * drops the fractional residue (~3 input samples per 4096-sample block at
+ * 44.1 kHz), and that drift distorts the pacing of a retained recording even
+ * though the detector never noticed. Each output still averages exactly the
+ * source window the old per-block math used on its first block.
+ */
+function createDownsampler(): (input: Float32Array, inputRate: number) => Float32Array {
+  let carry: Float32Array = new Float32Array(0)
+  // Exact source position of the next output, relative to `carry[0]`.
+  let phase = 0
 
-  if (inputRate <= 0) {
-    return new Float32Array(0)
-  }
-
-  const ratio = inputRate / TARGET_RATE
-  const outLen = Math.max(1, Math.floor(input.length / ratio))
-  const out = new Float32Array(outLen)
-
-  for (let i = 0; i < outLen; i++) {
-    const start = Math.floor(i * ratio)
-    const end = Math.min(input.length, Math.floor((i + 1) * ratio))
-    let sum = 0
-    let count = 0
-
-    for (let j = start; j < end; j++) {
-      sum += input[j] ?? 0
-      count++
+  return (input, inputRate) => {
+    if (inputRate === TARGET_RATE) {
+      return input
     }
 
-    out[i] = count > 0 ? sum / count : 0
+    if (inputRate <= 0) {
+      return new Float32Array(0)
+    }
+
+    const ratio = inputRate / TARGET_RATE
+    let merged = input
+
+    if (carry.length > 0) {
+      merged = new Float32Array(carry.length + input.length)
+      merged.set(carry, 0)
+      merged.set(input, carry.length)
+    }
+
+    const outLen = Math.floor((merged.length - phase) / ratio)
+    const out = new Float32Array(outLen)
+
+    for (let i = 0; i < outLen; i++) {
+      const start = Math.floor(phase + i * ratio)
+      const end = Math.min(merged.length, Math.floor(phase + (i + 1) * ratio))
+      let sum = 0
+      let count = 0
+
+      for (let j = start; j < end; j++) {
+        sum += merged[j] ?? 0
+        count++
+      }
+
+      out[i] = count > 0 ? sum / count : 0
+    }
+
+    const consumed = Math.floor(phase + outLen * ratio)
+
+    carry = merged.subarray(consumed)
+    phase = phase + outLen * ratio - consumed
+
+    return out
+  }
+}
+
+/** Float samples → int16 values (the retention ring's currency). */
+function floatToInt16(input: Float32Array): Int16Array {
+  const out = new Int16Array(input.length)
+
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i] ?? 0))
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff
   }
 
   return out
@@ -151,9 +203,11 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
   const mute = context.createGain()
   mute.gain.value = 0
 
+  const downsample = createDownsampler()
   let pending = new Float32Array(0)
   let stopped = false
   let failed = false
+  let feedPaused = false
   let silentFrames = 0
   let feedFailures = 0
   let stallTimer: ReturnType<typeof setTimeout> | undefined
@@ -185,6 +239,15 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
 
       void context.close().catch(() => undefined)
       stream.getTracks().forEach(t => t.stop())
+    },
+    pauseFeed() {
+      // The wake landed: detector feeding stops, the mic does not. The
+      // handoff's retained window plus this stream's continued samples are
+      // the first utterance; a silence watchdog trip here would kill a
+      // perfectly quiet user mid-handoff, so it rests too (the stall timer
+      // and track-ended checks still cover a dead capture chain).
+      feedPaused = true
+      queue.length = 0
     }
   }
 
@@ -268,7 +331,7 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     draining = true
 
     try {
-      while (!stopped && !failed && queue.length > 0) {
+      while (!stopped && !failed && !feedPaused && queue.length > 0) {
         const batch = queue.splice(0, MAX_FRAMES_PER_FEED)
 
         if (batch.length === 0) {
@@ -296,14 +359,14 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     } finally {
       draining = false
 
-      if (!stopped && !failed && queue.length > 0) {
+      if (!stopped && !failed && !feedPaused && queue.length > 0) {
         void drainQueue()
       }
     }
   }
 
   const enqueueFrame = (frame: Float32Array) => {
-    if (stopped) {
+    if (stopped || feedPaused) {
       return
     }
 
@@ -324,7 +387,7 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     armStallTimer()
 
     const input = event.inputBuffer.getChannelData(0)
-    const at16k = downsampleTo16k(input, context.sampleRate)
+    const at16k = downsample(input, context.sampleRate)
     // Append to pending and emit full frames
     const merged = new Float32Array(pending.length + at16k.length)
     merged.set(pending, 0)
@@ -334,6 +397,10 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
     while (offset + frameLength <= merged.length) {
       const frame = merged.subarray(offset, offset + frameLength)
       offset += frameLength
+
+      // Retention sees EVERY frame (silent ones too) before the feed queue,
+      // so the handoff's window is gapless regardless of feed timing.
+      options.onFrame?.(floatToInt16(frame))
 
       // A dead capture chain delivers endless digital zeros. Live mics never
       // do — their noise floor sits far above SILENCE_PEAK — so a long run of
@@ -351,7 +418,9 @@ export async function startClientWakeCapture(options: ClientWakeCaptureOptions):
       if (peak < SILENCE_PEAK) {
         silentFrames += 1
 
-        if (silentFrames >= silenceFramesThreshold) {
+        // Silence is only "deaf" while the detector is being fed — during a
+        // wake handoff a quiet user is ordinary, not a dead capture chain.
+        if (!feedPaused && silentFrames >= silenceFramesThreshold) {
           fail(
             new Error(
               'client wake capture hears only silence — the microphone delivers no audio; check OS mic access and re-toggle the ear'

@@ -78,7 +78,10 @@ vi.mock('@/store/voice-prefs', () => ({
 }))
 
 vi.mock('@/store/wake-word', () => ({
-  resumeWakeAfterVoice: vi.fn(async () => undefined)
+  cancelWakeUtteranceOffer: vi.fn(() => undefined),
+  peekWakeUtteranceOffer: vi.fn(() => null),
+  resumeWakeAfterVoice: vi.fn(async () => undefined),
+  takeWakeUtteranceOffer: vi.fn(() => null)
 }))
 
 vi.mock('../focus', () => ({

@@ -3,7 +3,12 @@
 // chain) while the ear still showed "listening" and no error ever surfaced.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { type ClientWakeCaptureHandle, startClientWakeCapture } from './wake-client-capture'
+import { WakeAudioHandoff } from './wake-audio-handoff'
+import {
+  type ClientWakeCaptureHandle,
+  type ClientWakeCaptureOptions,
+  startClientWakeCapture
+} from './wake-client-capture'
 
 class FakeTrack {
   readyState = 'live'
@@ -49,7 +54,8 @@ class FakeGain {
 const instances: FakeAudioContext[] = []
 
 class FakeAudioContext {
-  sampleRate = 48_000
+  static sampleRate = 48_000
+  sampleRate = FakeAudioContext.sampleRate
   state = 'running'
   destination = {}
   processors: FakeProcessor[] = []
@@ -82,6 +88,18 @@ const silentFrame = () => new Float32Array(4096) // digital zeros, like a dead c
 
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0))
 
+function flatten(parts: Int16Array[]): Int16Array {
+  const out = new Int16Array(parts.reduce((sum, part) => sum + part.length, 0))
+  let offset = 0
+
+  for (const part of parts) {
+    out.set(part, offset)
+    offset += part.length
+  }
+
+  return out
+}
+
 describe('startClientWakeCapture (issue #119089)', () => {
   let tracks: FakeTrack[]
   let getUserMedia: ReturnType<typeof vi.fn>
@@ -89,7 +107,7 @@ describe('startClientWakeCapture (issue #119089)', () => {
 
   const processor = () => instances[instances.length - 1].processors[0]
 
-  const start = (overrides: Record<string, unknown> = {}) =>
+  const start = (overrides: Partial<ClientWakeCaptureOptions> = {}) =>
     startClientWakeCapture({
       frameLength: 1280,
       request: async () => ({ fed: true }),
@@ -98,6 +116,7 @@ describe('startClientWakeCapture (issue #119089)', () => {
 
   beforeEach(() => {
     instances.length = 0
+    FakeAudioContext.sampleRate = 48_000
     handles = []
     tracks = [new FakeTrack()]
     getUserMedia = vi.fn().mockResolvedValue(new FakeStream(tracks))
@@ -235,5 +254,161 @@ describe('startClientWakeCapture (issue #119089)', () => {
     await flush()
     expect(onError).not.toHaveBeenCalled()
     expect(handle.active).toBe(true)
+  })
+
+  it('retains sequence-coded samples gaplessly despite a delayed feed and queue overflow', async () => {
+    FakeAudioContext.sampleRate = 16_000
+    // The feed hangs: frames back up and the queue drops the oldest — exactly
+    // the remote-latency case retention exists for.
+    const request = vi.fn(() => new Promise(() => undefined))
+    const handoff = new WakeAudioHandoff()
+    const handle = await start({ frameLength: 160, onFrame: frame => handoff.write(frame), request })
+    handles.push(handle)
+
+    // float (g+1)/32768 quantizes to int16 value exactly g — a monotone unit
+    // sequence, so any gap, duplication or reorder shows up in the decode.
+    const emitRamp = (from: number, count: number) => {
+      const input = new Float32Array(count)
+
+      for (let i = 0; i < count; i++) {
+        input[i] = (from + i + 1) / 32768
+      }
+
+      processor().emit(input)
+    }
+
+    emitRamp(0, 4 * 4096)
+    await flush()
+
+    // 102 frames of 160 samples against a 24-frame queue cap: the overflow
+    // dropped feed frames while one batch sits in flight forever.
+    expect(request).toHaveBeenCalled()
+
+    const lease = handoff.offer()
+    const snapshot = lease!.begin()
+
+    expect(snapshot![0]).toBe(0)
+
+    const parts: Int16Array[] = [snapshot!]
+
+    lease!.onSamples(chunk => parts.push(chunk))
+
+    // The 64-sample frame-assembly residue flushes into the continuation:
+    // across the ownership boundary the sequence must remain unbroken.
+    emitRamp(4 * 4096, 2 * 4096)
+    await flush()
+
+    const all = flatten(parts)
+
+    expect(all).toHaveLength(153 * 160)
+
+    const breaks: number[] = []
+
+    for (let i = 1; i < all.length; i++) {
+      if (all[i] !== all[i - 1] + 1) {
+        breaks.push(i)
+      }
+    }
+
+    expect(breaks).toEqual([])
+    expect(handle.active).toBe(true)
+  })
+
+  it('keeps the resampler continuous across callback boundaries at 44.1 kHz', async () => {
+    FakeAudioContext.sampleRate = 44_100
+    const frames: Int16Array[] = []
+    const handle = await start({ onFrame: frame => frames.push(frame) })
+    handles.push(handle)
+
+    for (let block = 0; block < 4; block++) {
+      const input = new Float32Array(4096)
+
+      for (let i = 0; i < 4096; i++) {
+        input[i] = (block * 4096 + i) / 32768
+      }
+
+      processor().emit(input)
+    }
+
+    await flush()
+
+    const out = flatten(frames)
+
+    // 4 × 4096 inputs at 44.1 kHz → 5944 samples at 16 kHz; only the four
+    // complete 1280-sample frames leave the assembler.
+    expect(out).toHaveLength(4 * 1280)
+
+    // Values track their source position. A per-block resampler that drops
+    // its fractional residue skips ~3 input samples per block — the decoded
+    // line would sit ~9 units high by the end. The phase-carrying resampler
+    // stays within a sample of the true line across every block boundary.
+    const ratio = 44_100 / 16_000
+    let maxDeviation = 0
+
+    for (let k = 0; k < out.length; k++) {
+      maxDeviation = Math.max(maxDeviation, Math.abs(out[k] - (out[0] + k * ratio)))
+    }
+
+    expect(maxDeviation).toBeLessThanOrEqual(3)
+  })
+
+  it('pauseFeed keeps the mic alive but stops detector feeding', async () => {
+    const request = vi.fn(async () => ({ fed: true }))
+    const frames: Int16Array[] = []
+    const handle = await start({ onFrame: frame => frames.push(frame), request })
+    handles.push(handle)
+
+    processor().emit(toneFrame())
+    await flush()
+
+    expect(request).toHaveBeenCalled()
+
+    const framesBefore = frames.length
+
+    handle.pauseFeed()
+    request.mockClear()
+    processor().emit(toneFrame())
+    await flush()
+
+    // The wake landed: no detector feeding, but retention keeps flowing and
+    // the stream stays alive for the first utterance.
+    expect(request).not.toHaveBeenCalled()
+    expect(frames.length).toBeGreaterThan(framesBefore)
+    expect(tracks[0].stop).not.toHaveBeenCalled()
+    expect(handle.active).toBe(true)
+  })
+
+  it('a quiet user during the wake handoff is not a dead capture chain', async () => {
+    const onError = vi.fn()
+    const handle = await start({ onError, silenceFramesThreshold: 5 })
+    handles.push(handle)
+
+    handle.pauseFeed()
+
+    for (let i = 0; i < 20; i++) {
+      processor().emit(silentFrame())
+    }
+
+    await flush()
+
+    expect(onError).not.toHaveBeenCalled()
+    expect(handle.active).toBe(true)
+  })
+
+  it('never fires the failure callback from a retired capture', async () => {
+    const onError = vi.fn()
+    const handle = await start({ onError, silenceFramesThreshold: 5 })
+    handles.push(handle)
+
+    handle.stop()
+
+    for (let i = 0; i < 10; i++) {
+      processor().emit(silentFrame())
+    }
+
+    tracks[0].onended?.()
+
+    expect(onError).not.toHaveBeenCalled()
+    expect(handle.active).toBe(false)
   })
 })

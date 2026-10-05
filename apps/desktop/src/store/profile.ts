@@ -1069,12 +1069,15 @@ export function pinNewChatProfile(name: string): string {
 // session list, where switching scope would throw away the browse state the user
 // is in. Points new chats at the profile and opens its backend so the next
 // message lands in the right place.
-export function newSessionInProfile(name: string): void {
+export function newSessionInProfile(name: string): Promise<void> {
   const target = pinNewChatProfile(name)
   leaveForeignProjectScope(target)
   requestFreshSession()
-  // #81094: surface the failed dial instead of failing silently.
-  void activateOnCurrentSource(target).catch((error: unknown) => {
+
+  // #81094: surface the failed dial instead of failing silently. Returned so
+  // callers that must wait for the profile to be ready (the wake voice path)
+  // can; fire-and-forget callers are unaffected.
+  return activateOnCurrentSource(target).catch((error: unknown) => {
     if (!notifyRemoteOverrideAuthFailure(target, error)) {
       notifyError(error, `Failed to open profile "${target}"`)
     }

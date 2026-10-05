@@ -1,5 +1,6 @@
 import { atom } from 'nanostores'
 
+import { WakeAudioHandoff, type WakeUtteranceLease } from '@/lib/wake-audio-handoff'
 import { type ClientWakeCaptureHandle, startClientWakeCapture } from '@/lib/wake-client-capture'
 import { $gateway } from '@/store/gateway'
 
@@ -36,11 +37,125 @@ export const $wakeWord = atom<WakeWordState>(INITIAL_WAKE_WORD_STATE)
 
 /** Active client mic stream for remote wake (capture: client). */
 let clientCapture: ClientWakeCaptureHandle | null = null
+/** Retention + first-utterance handoff for the active capture (one per capture). */
+let activeHandoff: WakeAudioHandoff | null = null
+/** The in-flight offer for the active handoff — duplicates share it. Kept
+ *  through consumption as a re-mint guard: once taken/cancelled the lease is
+ *  owned elsewhere and must never be offered again. */
+let activeOffer: WakeUtteranceOffer | null = null
+/** Monotonic capture generation: stale onError callbacks from retired
+ *  captures compare theirs and bail instead of killing a replacement. */
+let captureEpoch = 0
+/** The transport that armed the active capture. Offered with the handoff so
+ *  pause/resume/re-arm reach the OWNING socket even after `$gateway` moves
+ *  (a wake may target another profile). */
+let captureRequester: WakeRequester | null = null
+/** False while an offer awaits consumption: its release (TTL expiry) must
+ *  re-arm the ear. Set once the offer is consumed/cancelled/expired. */
+let offerHandled = true
 
-/** Stop client-side PCM capture (also called on wake.detected before voice). */
-export function stopClientCapture(): void {
+function teardownCapture(): void {
   clientCapture?.stop()
   clientCapture = null
+  activeHandoff = null
+  activeOffer = null
+  captureRequester = null
+}
+
+/** Stop client-side PCM capture (also called on wake.detected before voice).
+ *  External teardown wins over any pending offer's re-arm. */
+export function stopClientCapture(): void {
+  captureEpoch++
+  offerHandled = true
+  const handoff = activeHandoff
+  activeHandoff = null
+  activeOffer = null
+  // Cancelling the handoff fires onRelease → teardownCapture (idempotent).
+  handoff?.cancel()
+  teardownCapture()
+}
+
+/** A valid wake's owner-addressed handoff: the retained pre-event PCM plus a
+ *  single-use lease to the first voice utterance. `generation` keys duplicate
+ *  wake events to the same handoff; `targetProfile` is the profile the wake
+ *  routed to (may differ from the active profile). */
+export interface WakeUtteranceOffer {
+  lease: WakeUtteranceLease
+  generation: number
+  targetProfile: string | null
+  /** The transport that armed this listener — pause/resume/re-arm for this
+   *  wake go here, never to whatever `$gateway` points at later. */
+  request: WakeRequester
+}
+
+/**
+ * A valid wake detected: keep the mic stream alive (stop feeding the detector
+ * only) and lease the retained PCM to the first voice utterance. Returns null
+ * when there is no client handoff to offer (server-local capture, already
+ * recording, or a terminal handoff) — the caller falls back to a plain voice
+ * start. Duplicate wake events get the SAME offer for the same generation.
+ */
+export function offerWakeUtterance(targetProfile: string | null = null): WakeUtteranceOffer | null {
+  const capture = clientCapture
+  const handoff = activeHandoff
+  const requester = captureRequester
+
+  if (!capture?.active || !handoff || !requester) {
+    return null
+  }
+
+  if (activeOffer) {
+    return !offerHandled && activeOffer.lease.state === 'offered' ? activeOffer : null
+  }
+
+  const lease = handoff.offer()
+
+  if (!lease) {
+    return null
+  }
+
+  offerHandled = false
+  // Stop detector feeding WITHOUT stopping the track — the handoff needs the
+  // same capture chain to keep producing samples for the first utterance.
+  capture.pauseFeed()
+
+  activeOffer = { lease, generation: handoff.generation, targetProfile, request: requester }
+
+  return activeOffer
+}
+
+/** Non-consuming look at the pending offer (owner gate before the start
+ *  request latch is burned). */
+export function peekWakeUtteranceOffer(): WakeUtteranceOffer | null {
+  return !offerHandled && activeOffer?.lease.state === 'offered' ? activeOffer : null
+}
+
+/** Single consumption: the voice conversation owns re-arm from here (its end
+ *  runs the config-aware reconcile), so an offer release must not re-arm. */
+export function takeWakeUtteranceOffer(): WakeUtteranceOffer | null {
+  const offer = peekWakeUtteranceOffer()
+
+  if (!offer) {
+    return null
+  }
+
+  offerHandled = true
+
+  return offer
+}
+
+/** Abandon an unconsumed offer (an explicit mic start takes the device): the
+ *  lease cancels, the capture chain releases, and re-arm is the caller's. */
+export function cancelWakeUtteranceOffer(): void {
+  const offer = peekWakeUtteranceOffer()
+
+  if (!offer) {
+    return
+  }
+
+  offerHandled = true
+  activeOffer = null
+  offer.lease.cancel()
 }
 
 async function maybeStartClientCapture(result: WakeStartResponse | null | undefined): Promise<void> {
@@ -56,15 +171,65 @@ async function maybeStartClientCapture(result: WakeStartResponse | null | undefi
     return
   }
 
+  // Pin the transport for this capture: feed, error recovery and re-arm must
+  // reach the socket that armed the listener, not whatever `$gateway` points
+  // at after an async hop (profile swap, reconnect). With no transport up yet
+  // there is nothing to pin — the lazy requester keeps the historical
+  // fail-honest behavior (feeds fail loudly, #119089).
+  const transport = $gateway.get()
+
+  const pinnedRequester: WakeRequester = transport
+    ? async <T>(method: string, params: Record<string, unknown> = {}) =>
+        method === 'wake.start'
+          ? transport.request<T>(method, params, WAKE_START_TIMEOUT_MS)
+          : transport.request<T>(method, params)
+    : gatewayRequester
+
+  const epoch = ++captureEpoch
+  captureRequester = pinnedRequester
+  offerHandled = true
+
+  let handoff: WakeAudioHandoff
+
+  handoff = new WakeAudioHandoff({
+    // Exactly-once terminal cleanup: drop buffers, track and context. An
+    // offer nobody consumed (TTL expiry) re-arms the ear; a consumed one is
+    // the voice conversation's to re-arm at its end.
+    onRelease: () => {
+      // A newer capture owns the chain now — its lifecycle is not ours.
+      if (activeHandoff !== handoff) {
+        return
+      }
+
+      const orphaned = !offerHandled
+      offerHandled = true
+      teardownCapture()
+
+      if (orphaned) {
+        void resumeWakeAfterVoice(pinnedRequester).catch(() => undefined)
+      }
+    }
+  })
+
+  activeHandoff = handoff
+
   try {
     clientCapture = await startClientWakeCapture({
       frameLength: result.frame_length,
-      request: gatewayRequester,
+      request: pinnedRequester,
+      // Every resampled frame (silence included) feeds the retention ring so
+      // the pre-event window stays gapless through feed-queue drops.
+      onFrame: frame => handoff.write(frame),
       // The continuous PCM chain can die after arming (dead track, stalled
       // graph, sustained silence, refused feeds — #119089). A "listening" ear
       // that can never fire is worse than an honest off state, so mirror the
       // start-failure path: drop the capture, show the reason, release the lease.
       onError: error => {
+        // Generation check: a retired capture must not kill its replacement.
+        if (epoch !== captureEpoch) {
+          return
+        }
+
         stopClientCapture()
         const failed = $wakeWord.get()
         $wakeWord.set({
@@ -75,7 +240,7 @@ async function maybeStartClientCapture(result: WakeStartResponse | null | undefi
         })
 
         // Best-effort: release server lease if client mic failed.
-        void gatewayRequester('wake.stop', {}).catch(() => undefined)
+        void pinnedRequester('wake.stop', {}).catch(() => undefined)
       }
     })
   } catch (error) {
@@ -89,7 +254,7 @@ async function maybeStartClientCapture(result: WakeStartResponse | null | undefi
 
     // Best-effort: release server lease if client mic failed.
     try {
-      await gatewayRequester('wake.stop', {})
+      await pinnedRequester('wake.stop', {})
     } catch {
       // ignore
     }
@@ -421,5 +586,6 @@ export async function resumeWakeAfterVoice(request: WakeRequester = gatewayReque
 /** Test-only reset. */
 export function resetWakeWordState(): void {
   stopClientCapture()
+  offerHandled = true
   $wakeWord.set(INITIAL_WAKE_WORD_STATE)
 }

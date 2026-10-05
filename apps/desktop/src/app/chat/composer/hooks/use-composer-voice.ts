@@ -13,6 +13,7 @@ import {
 } from '@/lib/spoken-reply'
 import { CONVERSATION_LEASE, READ_ALOUD_LEASE, syncTtsLease } from '@/lib/tts-lease'
 import { toLiveHistory } from '@/lib/voice-live'
+import type { WakeUtteranceLease } from '@/lib/wake-audio-handoff'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
@@ -21,7 +22,13 @@ import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $voiceLiveStatus, refreshVoiceLiveStatus, selectedVoiceChatMode } from '@/store/voice-live'
 import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
-import { resumeWakeAfterVoice } from '@/store/wake-word'
+import {
+  cancelWakeUtteranceOffer,
+  peekWakeUtteranceOffer,
+  resumeWakeAfterVoice,
+  takeWakeUtteranceOffer,
+  type WakeRequester
+} from '@/store/wake-word'
 
 import { pinFloatingComposerCapture } from '../floating-target'
 import type { ComposerTarget } from '../focus'
@@ -214,6 +221,14 @@ export function useComposerVoice({
   // capture device while the wake listener still holds it makes getUserMedia
   // fail and the conversation never starts listening.
   const wakePauseBarrierRef = useRef<Promise<void> | null>(null)
+  // The wake handoff consumed for this conversation's first utterance, and the
+  // transport that armed that listener. Both are single-owner state claimed in
+  // the start-request effect below: the lease feeds the first take (later
+  // turns record normally), and pause/resume ride the ORIGINAL socket — a wake
+  // may target another profile, so ambient `$gateway` can point elsewhere by
+  // the time the conversation ends.
+  const wakeLeaseRef = useRef<WakeUtteranceLease | null>(null)
+  const wakeRequesterRef = useRef<WakeRequester | null>(null)
 
   const chainedConversation = useVoiceConversation({
     busy,
@@ -234,7 +249,15 @@ export function useComposerVoice({
     pendingResponse: pendingTurnResponse,
     // Before the conversation opens the mic, wait for any in-flight wake.pause
     // to finish releasing the capture device (see wakePauseBarrierRef).
-    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
+    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined,
+    // First turn after a wake: hand over the retained pre-wake PCM instead of
+    // opening a stream. Single-consumption — the next turn records normally.
+    captureLease: () => {
+      const lease = wakeLeaseRef.current
+      wakeLeaseRef.current = null
+
+      return lease
+    }
   })
 
   const liveConversation = useVoiceLiveConversation({
@@ -317,6 +340,10 @@ export function useComposerVoice({
       setVoiceConversationActive(false)
       void conversation.end()
     } else {
+      // Explicit start: the user took the mic by hand, so a pending wake
+      // handoff is abandoned (its retained PCM belongs to a wake turn) and
+      // the conversation records normally.
+      cancelWakeUtteranceOffer()
       activateConversation()
     }
   }, [activateConversation, conversation, disabled, voiceConversationActive])
@@ -328,14 +355,36 @@ export function useComposerVoice({
 
   // The bindable `composer.dictate` action shares the mic button's callback,
   // including its recording/transcribing state machine. Ignore disabled
-  // composers so an unavailable draft cannot acquire the microphone.
+  // composers so an unavailable draft cannot acquire the microphone. An
+  // explicit mic start takes the device away from a pending wake handoff —
+  // abandon the offer so its capture chain releases instead of contending.
   useEffect(
-    () => onComposerDictationRequest(requested => requested === target && !disabled && dictate()),
+    () =>
+      onComposerDictationRequest(requested => {
+        if (requested === target && !disabled) {
+          cancelWakeUtteranceOffer()
+          dictate()
+        }
+      }),
     [dictate, disabled, target]
   )
 
+  // eslint-disable-next-line no-restricted-syntax -- one-shot single-consumption wake-offer claim into refs, not an atom mirror
   useEffect(() => {
     if (target === 'main' && !disabled && takeVoiceConversationStart(voiceStartRequest) && !voiceConversationActive) {
+      // A wake-origin start claims the pending first-utterance handoff (owner
+      // gate: the main composer only — a tile composer must never consume the
+      // clip). Peek before taking so an offer aimed at another profile leaves
+      // the single-consumption slot untouched for its rightful owner.
+      const offer = peekWakeUtteranceOffer()
+
+      if (offer) {
+        const claimed = takeWakeUtteranceOffer()
+
+        wakeLeaseRef.current = claimed?.lease ?? null
+        wakeRequesterRef.current = claimed?.request ?? null
+      }
+
       activateConversation()
     }
   }, [activateConversation, disabled, target, voiceConversationActive, voiceStartRequest])
@@ -347,10 +396,14 @@ export function useComposerVoice({
 
     wakePausedRef.current = false
     wakePauseBarrierRef.current = null
+    const requester = wakeRequesterRef.current
+    wakeRequesterRef.current = null
     // Reconcile, don't just resume: the wake word is a persistent setting, so
     // ending a voice chat must re-arm the listener whenever config says
     // enabled — including when the raw resume loses the mic-release race.
-    void resumeWakeAfterVoice()
+    // Re-arm rides the transport that armed the listener when this was a wake
+    // turn (ambient `$gateway` may have moved to another profile since).
+    void resumeWakeAfterVoice(requester ?? undefined)
   }, [])
 
   // The ref is a request token (did WE issue wake.pause?), not an atom mirror —
@@ -360,7 +413,9 @@ export function useComposerVoice({
 
     const barrier = (async () => {
       try {
-        await $gateway.get()?.request('wake.pause', {})
+        const requester = wakeRequesterRef.current
+
+        await (requester ? requester('wake.pause', {}) : $gateway.get()?.request('wake.pause', {}))
       } catch {
         // No wake listener / older backend — nothing held the mic.
       }

@@ -16,6 +16,7 @@ import {
 } from '@/lib/voice-playback'
 import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { isTtsEcho } from '@/lib/voice-tts-echo'
+import type { WakeUtteranceLease } from '@/lib/wake-audio-handoff'
 import { notify, notifyError } from '@/store/notifications'
 import { $voicePlayback } from '@/store/voice-playback'
 import { $autoSpeakReplies, $bargeInEnabled, $bargeInThresholdMultiplier, $voiceSilenceMs } from '@/store/voice-prefs'
@@ -52,6 +53,10 @@ interface VoiceConversationOptions {
   /** Awaited right before the mic is opened. Used to let the wake-word listener
    *  fully release the capture device first, so the two never contend. */
   beforeMicOpen?: () => Promise<void> | void
+  /** First-utterance wake handoff, consumed ONCE by the first listening start
+   *  of the conversation (the retained pre-wake PCM replaces that take's mic
+   *  stream). Later turns and explicit starts see null and record normally. */
+  captureLease?: () => WakeUtteranceLease | null
 }
 
 /**
@@ -90,7 +95,8 @@ export function useVoiceConversation({
   consumePendingResponse,
   parkText,
   focusInput,
-  beforeMicOpen
+  beforeMicOpen,
+  captureLease
 }: VoiceConversationOptions) {
   const { t } = useI18n()
   const voiceCopy = t.notifications.voice
@@ -158,6 +164,13 @@ export function useVoiceConversation({
   useEffect(() => {
     beforeMicOpenRef.current = beforeMicOpen
   }, [beforeMicOpen])
+
+  const captureLeaseRef = useRef(captureLease)
+
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
+  useEffect(() => {
+    captureLeaseRef.current = captureLease
+  }, [captureLease])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -234,6 +247,22 @@ export function useVoiceConversation({
 
         if (!conversation || !live()) {
           return // ended while the recorder stopped
+        }
+
+        // A hard-ceiling-clipped take is incomplete by construction — the
+        // dropped samples mean the transcript cannot be trusted as the full
+        // utterance. Cancel it visibly and re-arm for a clean retry instead of
+        // submitting a truncated transcript as complete.
+        if (result?.truncated) {
+          notifyError(new Error(voiceCopy.tryRecordingAgain), voiceCopy.recordingFailed)
+
+          if (enabledRef.current && !mutedRef.current && !busyRef.current && statusRef.current !== 'speaking') {
+            pendingStartRef.current = true
+          }
+
+          setStatus('idle')
+
+          return
         }
 
         const meterFailed = Boolean(result?.meterFailed)
@@ -346,7 +375,8 @@ export function useVoiceConversation({
       onTranscribeAudio,
       voiceCopy.microphoneFailed,
       voiceCopy.recordingFailed,
-      voiceCopy.transcriptionFailed
+      voiceCopy.transcriptionFailed,
+      voiceCopy.tryRecordingAgain
     ]
   )
 
@@ -390,6 +420,10 @@ export function useVoiceConversation({
         silenceLevel: 0.075,
         silenceMs: $voiceSilenceMs.get(),
         idleSilenceMs: 12_000,
+        // First turn after a wake: the handoff's retained PCM IS this take —
+        // one continuous segment, no second getUserMedia stream. The provider
+        // is single-consumption, so later turns record normally.
+        captureLease: captureLeaseRef.current?.() ?? undefined,
         onError: error => {
           notifyError(error, voiceCopy.microphoneFailed)
           pendingStartRef.current = false
